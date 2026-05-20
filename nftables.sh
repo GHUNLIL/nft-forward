@@ -671,16 +671,28 @@ do_diagnose() {
     if [[ ${#RULES[@]} -gt 0 ]]; then
         read -rp "是否测试目标连通性？[y/N]: " test_conn
         if [[ "$test_conn" =~ ^[Yy]$ ]]; then
-            local rule lport dip dport
+            local rule lport dip dport test_port had_range=0
             for rule in "${RULES[@]}"; do
                 IFS='|' read -r lport dip dport <<< "$rule"
-                printf "  测试 %s:%s (TCP) ... " "$dip" "$dport"
-                if timeout 3 bash -c ">/dev/tcp/${dip}/${dport}" 2>/dev/null; then
+                # /dev/tcp 只能连单个端口；范围规则取起始端口做采样探测
+                if is_range "$dport"; then
+                    test_port="${dport%%-*}"
+                    had_range=1
+                    printf "  测试 %s:%s (TCP，范围只探测起始端口 %s) ... " "$dip" "$dport" "$test_port"
+                else
+                    test_port="$dport"
+                    printf "  测试 %s:%s (TCP) ... " "$dip" "$dport"
+                fi
+                if timeout 3 bash -c ">/dev/tcp/${dip}/${test_port}" 2>/dev/null; then
                     printf "\033[32m通\033[0m\n"
                 else
                     printf "\033[31m不通或超时\033[0m\n"
                 fi
             done
+            if (( had_range )); then
+                echo "  提示：端口范围仅探测了起始端口；若目标未在该端口监听，显示「不通」属正常，"
+                echo "        请改用范围内实际在用的业务端口自测（如 nc -vz 目标IP 端口）。"
+            fi
         fi
     fi
     echo ""
