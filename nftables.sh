@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v1.2
+# nftables 端口转发管理工具 v1.3
 # 交互式管理 DNAT 端口转发规则
 # 支持：单端口转发（可重映射）+ 端口范围同范围转发（端口保持不变，1:1）
+# 支持：TCP / UDP 分别转发到不同目标（同一端口可拆分协议）
 #
 
 # ============== 常量定义 ==============
@@ -65,6 +66,56 @@ is_range() { [[ "$1" == *-* ]]; }
 
 # nft / firewalld 用 '-' 表示范围；ufw / iptables 用 ':'。统一转换给后者用。
 to_colon_range() { printf '%s\n' "${1/-/:}"; }
+
+# ============== 协议辅助 ==============
+# RULES 数组格式: "本机端口|协议|目标IP|目标端口"，协议 ∈ {tcp, udp, both}
+# both 表示 tcp+udp 转发到同一目标；tcp / udp 表示仅该协议（同一端口可分别指向不同目标）
+
+# 展开为实际写入 nft / 防火墙的协议列表
+proto_list() {
+    case "$1" in
+        both) printf 'tcp udp\n' ;;
+        tcp)  printf 'tcp\n' ;;
+        udp)  printf 'udp\n' ;;
+    esac
+}
+
+# 列表 / 确认时的人类可读协议名
+proto_display() {
+    case "$1" in
+        both) printf 'tcp+udp\n' ;;
+        *)    printf '%s\n' "$1" ;;
+    esac
+}
+
+# 两个协议在 tcp/udp 层面是否存在交集（用于同端口冲突判断）
+proto_overlap() {
+    local a="$1" b="$2"
+    [[ "$a" == "both" || "$b" == "both" || "$a" == "$b" ]]
+}
+
+# read_dest 的返回值（用全局变量避免命令替换吞掉交互提示）
+DEST_IP=""
+DEST_PORT=""
+# 读取目标 IP 与目标端口；端口范围则保持同范围。$1=本机端口/范围  $2=提示前缀
+read_dest() {
+    local lport="$1" label="$2"
+    while true; do
+        read -rp "请输入${label}目标 IP 地址: " DEST_IP
+        if validate_ip "$DEST_IP"; then break; fi
+        err "IP 地址格式无效，请重新输入（如 192.168.1.100，不含前导零）。"
+    done
+    if is_range "$lport"; then
+        DEST_PORT="$lport"
+    else
+        while true; do
+            read -rp "请输入${label}目标端口 (1-65535) [默认: ${lport}]: " DEST_PORT
+            DEST_PORT="${DEST_PORT:-$lport}"
+            if validate_port "$DEST_PORT"; then break; fi
+            err "端口无效，请输入 1-65535 之间的数字。"
+        done
+    fi
+}
 
 validate_ip() {
     local ip="$1"
@@ -147,9 +198,9 @@ try_persist_iptables() {
 # 参数: $1=目标IP  $2=目标端口  $3=要排除的本机端口(即正在删除的那条)
 dest_still_used() {
     local check_ip="$1" check_dport="$2" exclude_lport="$3"
-    local rule lport dip dport
+    local rule lport proto dip dport
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport dip dport <<< "$rule"
+        IFS='|' read -r lport proto dip dport <<< "$rule"
         # 跳过正在删除的那条
         [[ "$lport" == "$exclude_lport" ]] && continue
         # 如果其他规则也指向同一 dest_ip:dport，返回 true
@@ -161,55 +212,55 @@ dest_still_used() {
 }
 
 # ============== firewalld / iptables 端口放行 ==============
-# 参数: $1=本机监听端口  $2=目标IP  $3=目标端口
+# 参数: $1=本机监听端口  $2=目标IP  $3=目标端口  $4=协议(both/tcp/udp，默认 both)
 firewall_open_port() {
-    local lport="$1" dest_ip="$2" dport="$3"
+    local lport="$1" dest_ip="$2" dport="$3" proto="${4:-both}"
     # ufw / iptables 的端口范围分隔符是 ':'，firewalld / nft 用 '-'
-    local lport_c dport_c
+    local lport_c dport_c p protos
     lport_c="$(to_colon_range "$lport")"
     dport_c="$(to_colon_range "$dport")"
+    protos="$(proto_list "$proto")"
 
     # firewalld 优先：如果 firewalld 在运行，只用 firewall-cmd，不碰 iptables
     # （firewalld 可能以 iptables 为后端，手动插 iptables 规则会被 reload 冲掉）
     if systemctl is-active --quiet firewalld 2>/dev/null; then
-        firewall-cmd --add-port="${lport}/tcp" --permanent >/dev/null 2>&1 || true
-        firewall-cmd --add-port="${lport}/udp" --permanent >/dev/null 2>&1 || true
+        for p in $protos; do
+            firewall-cmd --add-port="${lport}/${p}" --permanent >/dev/null 2>&1 || true
+        done
         firewall-cmd --reload >/dev/null 2>&1 || true
-        info "已在 firewalld 中放行端口 ${lport} (tcp+udp)。"
-        log_action "firewalld 放行端口 ${lport}"
+        info "已在 firewalld 中放行端口 ${lport} ($(proto_display "$proto"))。"
+        log_action "firewalld 放行端口 ${lport}/${proto}"
         return
     fi
 
     # UFW: Ubuntu 小白最常见的防火墙
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qw "active"; then
-        # INPUT: 放行进入本机的流量
-        ufw allow "${lport_c}/tcp" >/dev/null 2>&1 || true
-        ufw allow "${lport_c}/udp" >/dev/null 2>&1 || true
-        # FORWARD: ufw allow 只管 INPUT，转发流量需要 route allow
-        ufw route allow proto tcp to "${dest_ip}" port "${dport_c}" >/dev/null 2>&1 || true
-        ufw route allow proto udp to "${dest_ip}" port "${dport_c}" >/dev/null 2>&1 || true
-        info "已在 UFW 中放行端口 ${lport} 及转发到 ${dest_ip}:${dport} (tcp+udp)。"
-        log_action "UFW 放行端口 ${lport} 转发到 ${dest_ip}:${dport}"
+        for p in $protos; do
+            # INPUT: 放行进入本机的流量
+            ufw allow "${lport_c}/${p}" >/dev/null 2>&1 || true
+            # FORWARD: ufw allow 只管 INPUT，转发流量需要 route allow
+            ufw route allow proto "$p" to "${dest_ip}" port "${dport_c}" >/dev/null 2>&1 || true
+        done
+        info "已在 UFW 中放行端口 ${lport} 及转发到 ${dest_ip}:${dport} ($(proto_display "$proto"))。"
+        log_action "UFW 放行端口 ${lport}/${proto} 转发到 ${dest_ip}:${dport}"
         return
     fi
 
     # 无 firewalld / UFW，检测 iptables
     if has_iptables; then
-        # INPUT 链: 放行进入本机的流量（匹配 DNAT 前的本机端口）
-        iptables -C INPUT -p tcp --dport "${lport_c}" -j ACCEPT 2>/dev/null || \
-            iptables -I INPUT -p tcp --dport "${lport_c}" -j ACCEPT 2>/dev/null || true
-        iptables -C INPUT -p udp --dport "${lport_c}" -j ACCEPT 2>/dev/null || \
-            iptables -I INPUT -p udp --dport "${lport_c}" -j ACCEPT 2>/dev/null || true
-        # FORWARD 链: DNAT 后包的目的地已改写为 dest_ip:dport，需按此匹配
-        iptables -C FORWARD -d "${dest_ip}" -p tcp --dport "${dport_c}" -j ACCEPT 2>/dev/null || \
-            iptables -I FORWARD -d "${dest_ip}" -p tcp --dport "${dport_c}" -j ACCEPT 2>/dev/null || true
-        iptables -C FORWARD -d "${dest_ip}" -p udp --dport "${dport_c}" -j ACCEPT 2>/dev/null || \
-            iptables -I FORWARD -d "${dest_ip}" -p udp --dport "${dport_c}" -j ACCEPT 2>/dev/null || true
+        for p in $protos; do
+            # INPUT 链: 放行进入本机的流量（匹配 DNAT 前的本机端口）
+            iptables -C INPUT -p "$p" --dport "${lport_c}" -j ACCEPT 2>/dev/null || \
+                iptables -I INPUT -p "$p" --dport "${lport_c}" -j ACCEPT 2>/dev/null || true
+            # FORWARD 链: DNAT 后包的目的地已改写为 dest_ip:dport，需按此匹配
+            iptables -C FORWARD -d "${dest_ip}" -p "$p" --dport "${dport_c}" -j ACCEPT 2>/dev/null || \
+                iptables -I FORWARD -d "${dest_ip}" -p "$p" --dport "${dport_c}" -j ACCEPT 2>/dev/null || true
+        done
         # FORWARD 链: 放行回程已建立连接的包（DNAT 转发场景标配）
         iptables -C FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
             iptables -I FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-        info "已在 iptables 中放行: INPUT ${lport}, FORWARD → ${dest_ip}:${dport} (tcp+udp)。"
-        log_action "iptables 放行 INPUT:${lport} FORWARD:${dest_ip}:${dport}"
+        info "已在 iptables 中放行: INPUT ${lport}, FORWARD → ${dest_ip}:${dport} ($(proto_display "$proto"))。"
+        log_action "iptables 放行 INPUT:${lport} FORWARD:${dest_ip}:${dport} (${proto})"
         if ! try_persist_iptables; then
             warn "iptables 规则已生效但未能自动持久化，重启后可能丢失。"
             warn "如需持久化请安装 iptables-persistent / netfilter-persistent。"
@@ -217,63 +268,70 @@ firewall_open_port() {
     fi
 }
 
-# 参数: $1=本机监听端口  $2=目标IP  $3=目标端口  $4=是否跳过共享检查("force" 表示强制删除)
+# 参数: $1=本机监听端口  $2=目标IP  $3=目标端口  $4=协议(both/tcp/udp，默认 both)
+#       $5=是否跳过共享检查("force" 表示强制删除)
 firewall_close_port() {
-    local lport="$1" dest_ip="$2" dport="$3" force="${4:-}"
+    local lport="$1" dest_ip="$2" dport="$3" proto="${4:-both}" force="${5:-}"
     # ufw / iptables 的端口范围分隔符是 ':'，firewalld / nft 用 '-'
-    local lport_c dport_c
+    local lport_c dport_c p protos
     lport_c="$(to_colon_range "$lport")"
     dport_c="$(to_colon_range "$dport")"
+    protos="$(proto_list "$proto")"
 
     # firewalld
     if systemctl is-active --quiet firewalld 2>/dev/null; then
-        firewall-cmd --remove-port="${lport}/tcp" --permanent >/dev/null 2>&1 || true
-        firewall-cmd --remove-port="${lport}/udp" --permanent >/dev/null 2>&1 || true
+        for p in $protos; do
+            firewall-cmd --remove-port="${lport}/${p}" --permanent >/dev/null 2>&1 || true
+        done
         firewall-cmd --reload >/dev/null 2>&1 || true
-        info "已从 firewalld 中移除端口 ${lport} 的放行规则。"
-        log_action "firewalld 移除端口 ${lport}"
+        info "已从 firewalld 中移除端口 ${lport} ($(proto_display "$proto")) 的放行规则。"
+        log_action "firewalld 移除端口 ${lport}/${proto}"
         return
     fi
 
     # UFW（用 yes 管道防止 ufw delete 交互询问卡住脚本）
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qw "active"; then
-        yes | ufw delete allow "${lport_c}/tcp" >/dev/null 2>&1 || true
-        yes | ufw delete allow "${lport_c}/udp" >/dev/null 2>&1 || true
+        for p in $protos; do
+            yes | ufw delete allow "${lport_c}/${p}" >/dev/null 2>&1 || true
+        done
         # route 规则按目标匹配，只有在没有其他规则共享同一目标时才删除
         if [[ "$force" == "force" ]] || ! dest_still_used "$dest_ip" "$dport" "$lport"; then
-            yes | ufw route delete allow proto tcp to "${dest_ip}" port "${dport_c}" >/dev/null 2>&1 || true
-            yes | ufw route delete allow proto udp to "${dest_ip}" port "${dport_c}" >/dev/null 2>&1 || true
+            for p in $protos; do
+                yes | ufw route delete allow proto "$p" to "${dest_ip}" port "${dport_c}" >/dev/null 2>&1 || true
+            done
         fi
-        info "已从 UFW 中移除端口 ${lport} 的放行规则。"
-        log_action "UFW 移除端口 ${lport}"
+        info "已从 UFW 中移除端口 ${lport} ($(proto_display "$proto")) 的放行规则。"
+        log_action "UFW 移除端口 ${lport}/${proto}"
         return
     fi
 
     # iptables
     if has_iptables; then
-        # INPUT 链: 总是删除（lport 是唯一的）
-        iptables -D INPUT -p tcp --dport "${lport_c}" -j ACCEPT 2>/dev/null || true
-        iptables -D INPUT -p udp --dport "${lport_c}" -j ACCEPT 2>/dev/null || true
+        for p in $protos; do
+            # INPUT 链: 总是删除（lport+协议 是唯一的）
+            iptables -D INPUT -p "$p" --dport "${lport_c}" -j ACCEPT 2>/dev/null || true
+        done
         # FORWARD 链: 只有在没有其他规则共享同一 dest_ip:dport 时才删除
         if [[ "$force" == "force" ]] || ! dest_still_used "$dest_ip" "$dport" "$lport"; then
-            iptables -D FORWARD -d "${dest_ip}" -p tcp --dport "${dport_c}" -j ACCEPT 2>/dev/null || true
-            iptables -D FORWARD -d "${dest_ip}" -p udp --dport "${dport_c}" -j ACCEPT 2>/dev/null || true
+            for p in $protos; do
+                iptables -D FORWARD -d "${dest_ip}" -p "$p" --dport "${dport_c}" -j ACCEPT 2>/dev/null || true
+            done
         fi
         # 注意: 不删除 ESTABLISHED,RELATED 规则，它是通用规则，其他转发可能还需要
-        info "已从 iptables 中移除: INPUT ${lport}, FORWARD → ${dest_ip}:${dport}。"
-        log_action "iptables 移除 INPUT:${lport} FORWARD:${dest_ip}:${dport}"
+        info "已从 iptables 中移除: INPUT ${lport}, FORWARD → ${dest_ip}:${dport} ($(proto_display "$proto"))。"
+        log_action "iptables 移除 INPUT:${lport} FORWARD:${dest_ip}:${dport} (${proto})"
         try_persist_iptables || true
     fi
 }
 
 # ============== 端口占用检测（TCP + UDP） ==============
 check_port_conflict() {
-    local port="$1"
+    local port="$1" proto="${2:-both}"
     local conflict=""
-    if ss -tlnp 2>/dev/null | grep -qE ":${port}\b"; then
+    if [[ "$proto" == "both" || "$proto" == "tcp" ]] && ss -tlnp 2>/dev/null | grep -qE ":${port}\b"; then
         conflict="TCP"
     fi
-    if ss -ulnp 2>/dev/null | grep -qE ":${port}\b"; then
+    if [[ "$proto" == "both" || "$proto" == "udp" ]] && ss -ulnp 2>/dev/null | grep -qE ":${port}\b"; then
         if [[ -n "$conflict" ]]; then
             conflict="TCP+UDP"
         else
@@ -345,18 +403,47 @@ load_rules() {
     if [[ ! -f "${CONF_FILE}" ]]; then
         return
     fi
+
+    # 先把 tcp / udp 的 dnat 行各自收集为 "本机端口|目标IP|目标端口"
+    local -a tcp_rules=() udp_rules=()
+    local line p lp di dp
     while IFS= read -r line; do
         # 跳过注释行
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
-        # 只解析 tcp 的 dnat 行（每对 tcp/udp 只记录一次）
-        # 单端口（可重映射）：tcp dport N dnat to IP:N
-        if [[ "$line" =~ tcp\ dport\ ([0-9]+)\ dnat\ to\ ([0-9.]+):([0-9]+) ]]; then
-            RULES+=("${BASH_REMATCH[1]}|${BASH_REMATCH[2]}|${BASH_REMATCH[3]}")
-        # 端口范围（同范围、端口保持）：tcp dport N-M dnat to IP（无目标端口）
-        elif [[ "$line" =~ tcp\ dport\ ([0-9]+-[0-9]+)\ dnat\ to\ ([0-9.]+)$ ]]; then
-            RULES+=("${BASH_REMATCH[1]}|${BASH_REMATCH[2]}|${BASH_REMATCH[1]}")
+        # 单端口（可重映射）：<proto> dport N dnat to IP:N
+        if [[ "$line" =~ (tcp|udp)\ dport\ ([0-9]+)\ dnat\ to\ ([0-9.]+):([0-9]+) ]]; then
+            p="${BASH_REMATCH[1]}"; lp="${BASH_REMATCH[2]}"; di="${BASH_REMATCH[3]}"; dp="${BASH_REMATCH[4]}"
+            if [[ "$p" == "tcp" ]]; then tcp_rules+=("${lp}|${di}|${dp}"); else udp_rules+=("${lp}|${di}|${dp}"); fi
+        # 端口范围（同范围、端口保持）：<proto> dport N-M dnat to IP（无目标端口）
+        elif [[ "$line" =~ (tcp|udp)\ dport\ ([0-9]+-[0-9]+)\ dnat\ to\ ([0-9.]+)$ ]]; then
+            p="${BASH_REMATCH[1]}"; lp="${BASH_REMATCH[2]}"; di="${BASH_REMATCH[3]}"
+            if [[ "$p" == "tcp" ]]; then tcp_rules+=("${lp}|${di}|${lp}"); else udp_rules+=("${lp}|${di}|${lp}"); fi
         fi
     done < "${CONF_FILE}"
+
+    # 合并：tcp 与 udp 目标完全相同（同端口、同目标IP、同目标端口）→ both；否则各自独立
+    local -a udp_used=()
+    local t i match
+    for t in "${tcp_rules[@]}"; do
+        IFS='|' read -r lp di dp <<< "$t"
+        match=-1
+        for i in "${!udp_rules[@]}"; do
+            [[ -n "${udp_used[$i]:-}" ]] && continue
+            if [[ "${udp_rules[$i]}" == "$t" ]]; then match="$i"; break; fi
+        done
+        if (( match >= 0 )); then
+            RULES+=("${lp}|both|${di}|${dp}")
+            udp_used[$match]=1
+        else
+            RULES+=("${lp}|tcp|${di}|${dp}")
+        fi
+    done
+    # 剩下未配对的 udp 行：仅 udp 转发
+    for i in "${!udp_rules[@]}"; do
+        [[ -n "${udp_used[$i]:-}" ]] && continue
+        IFS='|' read -r lp di dp <<< "${udp_rules[$i]}"
+        RULES+=("${lp}|udp|${di}|${dp}")
+    done
 }
 
 write_conf_file() {
@@ -383,24 +470,24 @@ table ip ${TABLE_NAME} {
         type nat hook prerouting priority -100; policy accept;
 EOF
 
-    local rule lport dip dport
+    local rule lport proto dip dport p
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport dip dport <<< "$rule"
+        IFS='|' read -r lport proto dip dport <<< "$rule"
         if is_range "$lport"; then
             # 端口范围同范围：不指定目标端口，nft 保持原端口不变（1:1 转发到同范围）
-            cat >> "${tmp_file}" <<EOF
-
-        # 转发(端口范围同范围): 本机:${lport} -> ${dip}:${lport}
-        tcp dport ${lport} dnat to ${dip}
-        udp dport ${lport} dnat to ${dip}
-EOF
+            {
+                printf '\n        # 转发(端口范围同范围, %s): 本机:%s -> %s:%s\n' "$proto" "$lport" "$dip" "$lport"
+                for p in $(proto_list "$proto"); do
+                    printf '        %s dport %s dnat to %s\n' "$p" "$lport" "$dip"
+                done
+            } >> "${tmp_file}"
         else
-            cat >> "${tmp_file}" <<EOF
-
-        # 转发: 本机:${lport} -> ${dip}:${dport}
-        tcp dport ${lport} dnat to ${dip}:${dport}
-        udp dport ${lport} dnat to ${dip}:${dport}
-EOF
+            {
+                printf '\n        # 转发(%s): 本机:%s -> %s:%s\n' "$proto" "$lport" "$dip" "$dport"
+                for p in $(proto_list "$proto"); do
+                    printf '        %s dport %s dnat to %s:%s\n' "$p" "$lport" "$dip" "$dport"
+                done
+            } >> "${tmp_file}"
         fi
     done
 
@@ -413,13 +500,13 @@ EOF
 EOF
 
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport dip dport <<< "$rule"
-        cat >> "${tmp_file}" <<EOF
-
-        # 回源: 发往 ${dip}:${dport} 的已 DNAT 流量, SNAT 为本机 IP
-        ip daddr ${dip} tcp dport ${dport} ct status dnat snat to \$LOCAL_IP
-        ip daddr ${dip} udp dport ${dport} ct status dnat snat to \$LOCAL_IP
-EOF
+        IFS='|' read -r lport proto dip dport <<< "$rule"
+        {
+            printf '\n        # 回源(%s): 发往 %s:%s 的已 DNAT 流量, SNAT 为本机 IP\n' "$proto" "$dip" "$dport"
+            for p in $(proto_list "$proto"); do
+                printf '        ip daddr %s %s dport %s ct status dnat snat to $LOCAL_IP\n' "$dip" "$p" "$dport"
+            done
+        } >> "${tmp_file}"
     done
 
     cat >> "${tmp_file}" <<EOF
@@ -671,9 +758,14 @@ do_diagnose() {
     if [[ ${#RULES[@]} -gt 0 ]]; then
         read -rp "是否测试目标连通性？[y/N]: " test_conn
         if [[ "$test_conn" =~ ^[Yy]$ ]]; then
-            local rule lport dip dport test_port had_range=0
+            local rule lport proto dip dport test_port had_range=0
             for rule in "${RULES[@]}"; do
-                IFS='|' read -r lport dip dport <<< "$rule"
+                IFS='|' read -r lport proto dip dport <<< "$rule"
+                # 仅 UDP 的规则无法用 /dev/tcp 探测，跳过避免误报"不通"
+                if [[ "$proto" == "udp" ]]; then
+                    printf "  %s:%s (UDP) ... \033[33m跳过（UDP 无法用 TCP 探测）\033[0m\n" "$dip" "$dport"
+                    continue
+                fi
                 # /dev/tcp 只能连单个端口；范围规则取起始端口做采样探测
                 if is_range "$dport"; then
                     test_port="${dport%%-*}"
@@ -822,11 +914,11 @@ do_list() {
     echo "──────────────────────────────────────────────────────"
 
     local idx=1
-    local rule lport dip dport
+    local rule lport proto dip dport
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport dip dport <<< "$rule"
+        IFS='|' read -r lport proto dip dport <<< "$rule"
         printf "%-6s %-10s %-14s -> %-26s\n" \
-            "$idx" "tcp+udp" "$lport" "${dip}:${dport}"
+            "$idx" "$(proto_display "$proto")" "$lport" "${dip}:${dport}"
         ((idx++))
     done
     echo ""
@@ -863,54 +955,71 @@ do_add() {
         err "无效，请输入 1-65535 的单端口，或 起-止 范围（起<=止，如 30000-30100）。"
     done
 
-    # 检查端口是否已有转发规则
-    local rule rp
+    # 选择转发协议
+    echo ""
+    echo "请选择转发协议："
+    echo "  1) TCP + UDP → 同一目标 (默认)"
+    echo "  2) TCP + UDP → 各自不同目标"
+    echo "  3) 仅 TCP"
+    echo "  4) 仅 UDP"
+    local proto_choice proto_mode
+    read -rp "请选择 [1-4，默认 1]: " proto_choice
+    proto_choice="${proto_choice:-1}"
+    case "$proto_choice" in
+        1) proto_mode="both" ;;
+        2) proto_mode="split" ;;
+        3) proto_mode="tcp" ;;
+        4) proto_mode="udp" ;;
+        *) err "无效选择，已取消。"; return ;;
+    esac
+
+    # split（tcp/udp 各自不同目标）在协议占用层面等同于 both，用于冲突与占用检测
+    local check_proto="$proto_mode"
+    [[ "$proto_mode" == "split" ]] && check_proto="both"
+
+    # 检查端口是否已有协议冲突的转发规则（同端口的 tcp 与 udp 可分别指向不同目标）
+    local rule rp rproto
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r rp _ _ <<< "$rule"
-        if [[ "$rp" == "$lport" ]]; then
-            err "本机端口 ${lport} 已存在转发规则，请先删除后再添加。"
+        IFS='|' read -r rp rproto _ _ <<< "$rule"
+        if [[ "$rp" == "$lport" ]] && proto_overlap "$rproto" "$check_proto"; then
+            err "本机端口 ${lport} 已存在 $(proto_display "$rproto") 转发规则，与本次冲突，请先删除后再添加。"
             return
         fi
     done
 
     # 检查端口占用（仅单端口；端口范围逐个检测意义不大，跳过）
     if ! is_range "$lport"; then
-        if ! check_port_conflict "$lport"; then
+        if ! check_port_conflict "$lport" "$check_proto"; then
             info "已取消。"
             return
         fi
     fi
 
-    # 输入目标 IP
-    local dip
-    while true; do
-        read -rp "请输入目标 IP 地址: " dip
-        if validate_ip "$dip"; then
-            break
-        fi
-        err "IP 地址格式无效，请重新输入（如 192.168.1.100，不含前导零）。"
-    done
-
-    # 目标端口：端口范围固定走"同范围"（端口保持不变），单端口可自定义重映射
-    local dport
     if is_range "$lport"; then
-        dport="$lport"
-        info "端口范围转发：将 1:1 转发到 ${dip} 的同一范围 ${lport}（端口保持不变）。"
+        info "端口范围转发：将 1:1 转发到目标的同一范围 ${lport}（端口保持不变）。"
+    fi
+
+    # 收集目标，构造待添加规则（split 模式生成 tcp / udp 两条独立规则）
+    local -a to_add=()
+    if [[ "$proto_mode" == "split" ]]; then
+        read_dest "$lport" "TCP "
+        local tcp_ip="$DEST_IP" tcp_port="$DEST_PORT"
+        read_dest "$lport" "UDP "
+        to_add+=("${lport}|tcp|${tcp_ip}|${tcp_port}")
+        to_add+=("${lport}|udp|${DEST_IP}|${DEST_PORT}")
     else
-        while true; do
-            read -rp "请输入目标端口 (1-65535) [默认: ${lport}]: " dport
-            dport="${dport:-$lport}"
-            if validate_port "$dport"; then
-                break
-            fi
-            err "端口无效，请输入 1-65535 之间的数字。"
-        done
+        read_dest "$lport" ""
+        to_add+=("${lport}|${proto_mode}|${DEST_IP}|${DEST_PORT}")
     fi
 
     # 确认
     echo ""
     echo "即将添加转发规则:"
-    echo "  本机端口 ${lport} (tcp+udp) → ${dip}:${dport}"
+    local r lp pr di dp
+    for r in "${to_add[@]}"; do
+        IFS='|' read -r lp pr di dp <<< "$r"
+        echo "  本机端口 ${lp} ($(proto_display "$pr")) → ${di}:${dp}"
+    done
     read -rp "确认添加？[Y/n]: " confirm
     if [[ "$confirm" =~ ^[Nn]$ ]]; then
         info "已取消。"
@@ -919,15 +1028,18 @@ do_add() {
 
     # 备份并写入
     backup_conf
-    RULES+=("${lport}|${dip}|${dport}")
+    RULES+=("${to_add[@]}")
     if ! write_conf_file; then
         return
     fi
 
     if reload_rules; then
-        firewall_open_port "$lport" "$dip" "$dport"
-        info "转发规则添加成功: ${lport} → ${dip}:${dport}"
-        log_action "新增转发: ${lport} -> ${dip}:${dport}"
+        for r in "${to_add[@]}"; do
+            IFS='|' read -r lp pr di dp <<< "$r"
+            firewall_open_port "$lp" "$di" "$dp" "$pr"
+            log_action "新增转发: ${lp}/${pr} -> ${di}:${dp}"
+        done
+        info "转发规则添加成功。"
         info "若转发不通，请使用菜单中的【诊断/自检】排查。"
     else
         err "规则加载失败，请检查配置。"
@@ -956,11 +1068,11 @@ do_delete() {
     echo "────────────────────────────────────────────────────"
 
     local idx=1
-    local rule lport dip dport
+    local rule lport proto dip dport
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport dip dport <<< "$rule"
+        IFS='|' read -r lport proto dip dport <<< "$rule"
         printf "%-6s %-10s %-14s -> %-26s\n" \
-            "$idx" "tcp+udp" "$lport" "${dip}:${dport}"
+            "$idx" "$(proto_display "$proto")" "$lport" "${dip}:${dport}"
         ((idx++))
     done
     echo ""
@@ -980,10 +1092,10 @@ do_delete() {
     fi
 
     local target="${RULES[$((choice-1))]}"
-    IFS='|' read -r lport dip dport <<< "$target"
+    IFS='|' read -r lport proto dip dport <<< "$target"
 
     echo "即将删除转发规则:"
-    echo "  本机端口 ${lport} (tcp+udp) → ${dip}:${dport}"
+    echo "  本机端口 ${lport} ($(proto_display "$proto")) → ${dip}:${dport}"
     read -rp "确认删除？[Y/n]: " confirm
     if [[ "$confirm" =~ ^[Nn]$ ]]; then
         info "已取消。"
@@ -1001,9 +1113,9 @@ do_delete() {
 
     if reload_rules; then
         # nft 规则已成功更新后，再清理防火墙放行（RULES 已移除该条，dest_still_used 能正确判断）
-        firewall_close_port "$lport" "$dip" "$dport"
-        info "转发规则已删除: ${lport} → ${dip}:${dport}"
-        log_action "删除转发: ${lport} -> ${dip}:${dport}"
+        firewall_close_port "$lport" "$dip" "$dport" "$proto"
+        info "转发规则已删除: ${lport} ($(proto_display "$proto")) → ${dip}:${dport}"
+        log_action "删除转发: ${lport}/${proto} -> ${dip}:${dport}"
     else
         err "规则加载失败，请检查配置。"
     fi
@@ -1036,10 +1148,10 @@ do_clear_all() {
     backup_conf
 
     # 先清理所有防火墙规则（清空场景用 force，无需检查共享）
-    local rule lport dip dport
+    local rule lport proto dip dport
     for rule in "${RULES[@]}"; do
-        IFS='|' read -r lport dip dport <<< "$rule"
-        firewall_close_port "$lport" "$dip" "$dport" "force"
+        IFS='|' read -r lport proto dip dport <<< "$rule"
+        firewall_close_port "$lport" "$dip" "$dport" "$proto" "force"
     done
 
     RULES=()
@@ -1062,11 +1174,11 @@ main_menu() {
     while true; do
         echo ""
         echo "========================================"
-        echo "   nftables 端口转发管理工具 v1.2"
+        echo "   nftables 端口转发管理工具 v1.3"
         echo "========================================"
         echo "  1) 安装 nftables"
         echo "  2) 查看现有端口转发"
-        echo "  3) 新增端口转发（单端口 / 端口范围同范围）"
+        echo "  3) 新增端口转发（单端口 / 范围 / 分协议）"
         echo "  4) 删除端口转发"
         echo "  5) 一键清空所有转发"
         echo "  6) 诊断/自检"
