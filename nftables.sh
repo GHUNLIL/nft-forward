@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# nftables 端口转发管理工具 v1.3
+# nftables 端口转发管理工具 v1.4
 # 交互式管理 DNAT 端口转发规则
 # 支持：单端口转发（可重映射）+ 端口范围同范围转发（端口保持不变，1:1）
 # 支持：TCP / UDP 分别转发到不同目标（同一端口可拆分协议）
@@ -542,7 +542,7 @@ backup_conf() {
     fi
 }
 
-# ============== 开启内核参数：IP 转发 + BBR/fq ==============
+# ============== 开启内核参数：仅 IPv4 转发 ==============
 enable_ip_forward() {
     local current
     current=$(sysctl -n net.ipv4.ip_forward 2>/dev/null) || current="0"
@@ -564,62 +564,10 @@ enable_ip_forward() {
         echo "net.ipv4.ip_forward=1" >> "${SYSCTL_CONF}" 2>/dev/null || true
     fi
 
-    sysctl -p "${SYSCTL_CONF}" >/dev/null 2>&1 || true
-}
-
-enable_bbr_fq() {
-    # 1) 内核是否支持 bbr
-    modprobe tcp_bbr 2>/dev/null || true
-    if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
-        warn "内核不支持 BBR（tcp_available_congestion_control 中未找到 bbr），已跳过。"
-        return 0
-    fi
-
-    # 2) 读取当前配置
-    local cur_cc cur_qd
-    cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || cur_cc=""
-    cur_qd=$(sysctl -n net.core.default_qdisc 2>/dev/null) || cur_qd=""
-
-    # 3) 判断是否已经开启
-    if [[ "$cur_cc" == "bbr" && "$cur_qd" == "fq" ]]; then
-        info "BBR + fq 已启用（无需修改）。"
-        return 0
-    fi
-
-    # 4) 没开则开启（立即生效）
-    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
-
-    # 再读一次确认
-    cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || cur_cc=""
-    cur_qd=$(sysctl -n net.core.default_qdisc 2>/dev/null) || cur_qd=""
-
-    if [[ "$cur_cc" == "bbr" && "$cur_qd" == "fq" ]]; then
-        info "已开启 BBR + fq。"
-        log_action "开启 BBR+fq"
-    else
-        warn "尝试开启 BBR+fq 后未确认生效（当前: cc=${cur_cc:-?}, qdisc=${cur_qd:-?}），可能被系统配置覆盖。"
-    fi
-
-    # 5) 持久化：写入 SYSCTL_CONF（用“替换/追加”避免覆盖别的项）
-    mkdir -p "$(dirname "${SYSCTL_CONF}")" 2>/dev/null || true
-    touch "${SYSCTL_CONF}" 2>/dev/null || true
-
-    if grep -qE '^[[:space:]]*net\.core\.default_qdisc[[:space:]]*=' "${SYSCTL_CONF}"; then
-        sed -i -E 's|^[[:space:]]*net\.core\.default_qdisc[[:space:]]*=.*|net.core.default_qdisc=fq|' "${SYSCTL_CONF}" 2>/dev/null || true
-    else
-        echo "net.core.default_qdisc=fq" >> "${SYSCTL_CONF}" 2>/dev/null || true
-    fi
-
-    if grep -qE '^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=' "${SYSCTL_CONF}"; then
-        sed -i -E 's/^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=.*/net.ipv4.tcp_congestion_control=bbr/' "${SYSCTL_CONF}" 2>/dev/null || true
-    else
-        echo "net.ipv4.tcp_congestion_control=bbr" >> "${SYSCTL_CONF}" 2>/dev/null || true
-    fi
+    # 清理旧版本曾写入本文件的 BBR/fq 项，避免覆盖专用 BBR 优化脚本。
+    sed -i -E '/^[[:space:]]*net\.core\.default_qdisc[[:space:]]*=/d; /^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=/d' "${SYSCTL_CONF}" 2>/dev/null || true
 
     sysctl -p "${SYSCTL_CONF}" >/dev/null 2>&1 || true
-    info "已持久化 BBR + fq 到 ${SYSCTL_CONF}。"
-    log_action "持久化 BBR+fq 到 ${SYSCTL_CONF}"
 }
 
 # ============== 检测防火墙状态（仅提示） ==============
@@ -829,7 +777,6 @@ do_install() {
         log_action "清空已有配置并由脚本接管 (备份时间戳: ${ts})"
 
         enable_ip_forward
-        enable_bbr_fq
         check_firewall_status
         init_conf
 
@@ -884,7 +831,6 @@ do_install() {
     log_action "安装 nftables"
 
     enable_ip_forward
-    enable_bbr_fq
     check_firewall_status
     init_conf
     # 先写好配置，再启用服务，确保服务启动时直接加载我们的配置

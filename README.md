@@ -8,7 +8,7 @@
 - **端口范围同范围转发**：输入 `起-止`（如 `30000-30100`），自动 1:1 转发到目标同一范围，端口不变
 - **协议可拆分**：同一本机端口的 TCP 与 UDP 可分别转发到不同目标 IP/端口，也可只转发 TCP 或只转发 UDP
 - TCP + UDP 一并转发，自动 SNAT 回源（保证回程走本机出口 IP）
-- 自动开启 IPv4 转发、BBR + fq
+- 自动开启 IPv4 转发，不接管 BBR/sysctl 网络优化参数
 - 自动适配并放行防火墙：firewalld / UFW / iptables（范围分隔符自动转换）
 - 规则持久化到 `/etc/nftables.d/`，重启自动恢复
 - 内置诊断 / 自检、备份、一键清空
@@ -17,6 +17,16 @@
 
 - root 权限
 - Debian/Ubuntu、RHEL/CentOS/Fedora 或 Arch（自动识别包管理器安装 nftables）
+
+## BBR / sysctl 说明
+
+本脚本只负责 nftables 端口转发和必要的 IPv4 转发开关，不再写入 `net.ipv4.tcp_congestion_control`、`net.core.default_qdisc` 等 BBR/sysctl 网络优化参数。
+
+如需 BBR、队列、RPS、conntrack、TFO、nofile 等极致网络优化，请使用独立脚本：
+
+```bash
+sudo bash -c 'bash <(curl -fsSL https://raw.githubusercontent.com/GHUNLIL/network-bbr-optimizer/main/bbr.sh)'
+```
 
 ## 使用
 
